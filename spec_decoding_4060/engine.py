@@ -1,7 +1,7 @@
+from typing import Any
 import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
-from config import SpecConfig
 from kv_cache_utils import crop_past_key_values
 
 # Patch upstream HF AssistedCandidateGenerator bug in transformers >= 5.x
@@ -25,10 +25,16 @@ except (ImportError, AttributeError):
     pass
 
 class SpeculativeEngine:
-    def __init__(self, config: SpecConfig):
+    def __init__(self, config: Any):
         self.cfg = config
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+        
+        # Explicitly activate selected CUDA device
+        if torch.cuda.is_available() and hasattr(self.cfg, "DEVICE") and "cuda" in str(self.cfg.DEVICE):
+            device_str = str(self.cfg.DEVICE)
+            device_idx = int(device_str.split(":")[1]) if ":" in device_str else 0
+            torch.cuda.set_device(device_idx)
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
 
         print(f"[Init] Loading Tokenizer from {self.cfg.TARGET_MODEL_ID}...")
         self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.TARGET_MODEL_ID)
@@ -52,7 +58,16 @@ class SpeculativeEngine:
         ).eval()
 
         vram_gb = torch.cuda.memory_allocated() / (1024 ** 3)
-        print(f"[Init] Models loaded successfully! Static VRAM Usage: {vram_gb:.2f} GB / 8.00 GB\n")
+        total_vram_gb = getattr(self.cfg, "VRAM_TOTAL_GB", None)
+        if total_vram_gb is None and torch.cuda.is_available():
+            try:
+                device_str = str(getattr(self.cfg, "DEVICE", "cuda:0"))
+                device_idx = int(device_str.split(":")[1]) if ":" in device_str else 0
+                total_vram_gb = torch.cuda.get_device_properties(device_idx).total_memory / (1024 ** 3)
+            except Exception:
+                total_vram_gb = 8.00
+        total_vram_str = f"{total_vram_gb:.2f} GB" if total_vram_gb is not None else "N/A"
+        print(f"[Init] Models loaded successfully! Static VRAM Usage: {vram_gb:.2f} GB / {total_vram_str}\n")
 
     def format_prompt(self, prompt_text: str) -> torch.Tensor:
         messages = [
@@ -204,7 +219,10 @@ class SpeculativeEngine:
             "time_sec": elapsed,
             "tps": generated_tokens / elapsed,
             "acceptance_rate": acceptance_rate,
-            "tokens_per_target_step": generated_tokens / target_forward_passes
+            "tokens_per_target_step": generated_tokens / target_forward_passes,
+            "total_drafted": total_drafted,
+            "total_accepted": total_accepted,
+            "target_forward_passes": target_forward_passes
         }
 
     @torch.inference_mode()

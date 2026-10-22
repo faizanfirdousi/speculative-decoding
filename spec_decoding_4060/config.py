@@ -1,6 +1,11 @@
 import torch
 
 class SpecConfig:
+    # Profile Identity & Hardware Verification
+    GPU_PROFILE: str = "rtx4060"
+    EXPECTED_GPU_SUBSTR: str = "RTX 4060"
+    VRAM_TOTAL_GB: float = 8.0  # Informational; detected at runtime
+
     # Model Selection (Fits in 8GB VRAM in pure bfloat16)
     TARGET_MODEL_ID: str = "Qwen/Qwen2.5-3B-Instruct"
     DRAFT_MODEL_ID: str = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -13,6 +18,12 @@ class SpecConfig:
     # Speculative Decoding Hyperparameters
     GAMMA: int = 5                       # Lookahead K (5 is optimal for 0.5B -> 3B)
     MAX_NEW_TOKENS: int = 256
+
+    # Benchmark Execution Settings
+    WARMUP_ITERATIONS: int = 1
+    WARMUP_TOKENS: int = 16
+    WARMUP_PROMPT: str = "Say hello in one word."
+    OUTPUT_DIR: str = "results/rtx4060"
     
     # Benchmark Prompts (High acceptance rate & standard reasoning)
     PROMPTS = [
@@ -29,3 +40,7 @@ class SpecConfig:
             "text": "Explain how CPU L1, L2, and L3 caches work, including cache lines, associativity, and the MESI coherence protocol."
         }
     ]
+
+
+# Alias for explicit profile-based imports
+SpecConfig4060 = SpecConfig

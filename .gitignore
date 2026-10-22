@@ -41,10 +41,11 @@ venv.bak/
 .cache/
 hf_cache/
 
-# PyTorch / CUDA profiling logs
+# PyTorch / CUDA profiling logs & benchmark outputs
 *.nvvp
 *.qdrep
 *.log
+results/
 
 # Unit test / coverage reports
 htmlcov/
