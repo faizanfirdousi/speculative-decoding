@@ -1,0 +1,232 @@
+import time
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+from config import SpecConfig
+from kv_cache_utils import crop_past_key_values
+
+# Patch upstream HF AssistedCandidateGenerator bug in transformers >= 5.x
+# where assistant KV cache is not properly rolled back when draft tokens are rejected
+try:
+    from transformers.generation.candidate_generator import AssistedCandidateGenerator
+    _orig_update_past = AssistedCandidateGenerator._update_past_and_masks
+
+    def _patched_update_past(self, input_ids, remove_from_pkv=0, num_added_tokens=1):
+        res = _orig_update_past(self, input_ids, remove_from_pkv, num_added_tokens)
+        pkv = self.assistant_kwargs.get("past_key_values", None)
+        if pkv is not None:
+            cur_pkv_len = pkv.get_seq_length()
+            target_len = input_ids.shape[-1] - 1
+            if cur_pkv_len > target_len:
+                pkv.crop(-(cur_pkv_len - target_len))
+        return res
+
+    AssistedCandidateGenerator._update_past_and_masks = _patched_update_past
+except (ImportError, AttributeError):
+    pass
+
+class SpeculativeEngine:
+    def __init__(self, config: SpecConfig):
+        self.cfg = config
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        print(f"[Init] Loading Tokenizer from {self.cfg.TARGET_MODEL_ID}...")
+        self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.TARGET_MODEL_ID)
+
+        print(f"[Init] Loading Target Model ({self.cfg.TARGET_MODEL_ID}) in {self.cfg.DTYPE}...")
+        self.target_model = AutoModelForCausalLM.from_pretrained(
+            self.cfg.TARGET_MODEL_ID,
+            dtype=self.cfg.DTYPE,
+            device_map=self.cfg.DEVICE,
+            attn_implementation=self.cfg.ATTN_IMPLEMENTATION,
+            low_cpu_mem_usage=True
+        ).eval()
+
+        print(f"[Init] Loading Draft Model ({self.cfg.DRAFT_MODEL_ID}) in {self.cfg.DTYPE}...")
+        self.draft_model = AutoModelForCausalLM.from_pretrained(
+            self.cfg.DRAFT_MODEL_ID,
+            dtype=self.cfg.DTYPE,
+            device_map=self.cfg.DEVICE,
+            attn_implementation=self.cfg.ATTN_IMPLEMENTATION,
+            low_cpu_mem_usage=True
+        ).eval()
+
+        vram_gb = torch.cuda.memory_allocated() / (1024 ** 3)
+        print(f"[Init] Models loaded successfully! Static VRAM Usage: {vram_gb:.2f} GB / 8.00 GB\n")
+
+    def format_prompt(self, prompt_text: str) -> torch.Tensor:
+        messages = [
+            {"role": "system", "content": "You are a helpful, concise technical assistant."},
+            {"role": "user", "content": prompt_text}
+        ]
+        text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        return self.tokenizer(text, return_tensors="pt").input_ids.to(self.cfg.DEVICE)
+
+    @torch.inference_mode()
+    def autoregressive_generate(self, input_ids: torch.Tensor, max_new_tokens: int):
+        """Standard token-by-token greedy decoding on the Target Model."""
+        torch.cuda.synchronize()
+        start_time = time.perf_counter()
+
+        past_kv = DynamicCache()
+        curr_ids = input_ids.clone()
+        next_input = curr_ids
+
+        for _ in range(max_new_tokens):
+            outputs = self.target_model(
+                input_ids=next_input,
+                past_key_values=past_kv,
+                use_cache=True
+            )
+            past_kv = outputs.past_key_values
+            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+            curr_ids = torch.cat([curr_ids, next_token], dim=-1)
+            next_input = next_token
+
+            if next_token.item() == self.tokenizer.eos_token_id:
+                break
+
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start_time
+        generated_tokens = curr_ids.shape[1] - input_ids.shape[1]
+        return {
+            "output_ids": curr_ids,
+            "tokens_generated": generated_tokens,
+            "time_sec": elapsed,
+            "tps": generated_tokens / elapsed
+        }
+
+    @torch.inference_mode()
+    def custom_speculative_generate(self, input_ids: torch.Tensor, max_new_tokens: int, gamma: int):
+        """
+        Custom Greedy Speculative Decoding with KV-Cache Rollback.
+        Guarantees zero prompt recomputation and 100% mathematical equivalence to Target.
+        """
+        torch.cuda.synchronize()
+        start_time = time.perf_counter()
+
+        target_kv = DynamicCache()
+        draft_kv = DynamicCache()
+
+        curr_ids = input_ids.clone()
+        prompt_len = input_ids.shape[1]
+
+        # 1. Prefill both models with the initial prompt
+        target_out = self.target_model(input_ids=curr_ids, past_key_values=target_kv, use_cache=True)
+        target_kv = target_out.past_key_values
+        
+        draft_out = self.draft_model(input_ids=curr_ids[:, :-1], past_key_values=draft_kv, use_cache=True)
+        draft_kv = draft_out.past_key_values
+
+        # First token comes directly from the target model's prefill pass
+        first_token = torch.argmax(target_out.logits[:, -1, :], dim=-1, keepdim=True)
+        curr_ids = torch.cat([curr_ids, first_token], dim=-1)
+
+        total_drafted = 0
+        total_accepted = 0
+        target_forward_passes = 1
+
+        # 2. Main Speculative Loop
+        while (curr_ids.shape[1] - prompt_len) < max_new_tokens:
+            if curr_ids[0, -1].item() == self.tokenizer.eos_token_id:
+                break
+
+            # Determine how many tokens to draft without exceeding max_new_tokens
+            remaining = max_new_tokens - (curr_ids.shape[1] - prompt_len)
+            current_gamma = min(gamma, remaining)
+            if current_gamma <= 0:
+                break
+
+            # --- STEP A: DRAFTING K TOKENS ---
+            draft_tokens = []
+            # Draft model needs to process from its current KV cache state up to curr_ids
+            draft_input = curr_ids[:, draft_kv.get_seq_length():]
+
+            for _ in range(current_gamma):
+                d_out = self.draft_model(input_ids=draft_input, past_key_values=draft_kv, use_cache=True)
+                draft_kv = d_out.past_key_values
+                next_draft_token = torch.argmax(d_out.logits[:, -1, :], dim=-1, keepdim=True)
+                draft_tokens.append(next_draft_token)
+                draft_input = next_draft_token
+
+            draft_seq = torch.cat(draft_tokens, dim=-1)  # Shape: (1, current_gamma)
+            total_drafted += current_gamma
+
+            # --- STEP B: PARALLEL TARGET VERIFICATION ---
+            # Target model currently has KV cache up to `curr_ids.shape[1] - 1`.
+            # We feed the last confirmed token + all K draft tokens in ONE forward pass.
+            verify_input = torch.cat([curr_ids[:, -1:], draft_seq], dim=-1)  # Shape: (1, current_gamma + 1)
+            t_out = self.target_model(input_ids=verify_input, past_key_values=target_kv, use_cache=True)
+            target_kv = t_out.past_key_values
+            target_forward_passes += 1
+
+            # Target predictions for each of the drafted positions + 1 bonus position
+            target_preds = torch.argmax(t_out.logits, dim=-1)  # Shape: (1, current_gamma + 1)
+
+            # --- STEP C: ACCEPT / REJECT & KV ROLLBACK ---
+            n_accepted = 0
+            for i in range(current_gamma):
+                if draft_seq[0, i].item() == target_preds[0, i].item():
+                    n_accepted += 1
+                    if draft_seq[0, i].item() == self.tokenizer.eos_token_id:
+                        break
+                else:
+                    break
+
+            total_accepted += n_accepted
+
+            # Accepted tokens from draft
+            if n_accepted > 0:
+                curr_ids = torch.cat([curr_ids, draft_seq[:, :n_accepted]], dim=-1)
+
+            # Always append the target model's authoritative token at position `n_accepted`
+            # (Either the correction token if rejected early, or the bonus (K+1)-th token if all K accepted!)
+            has_eos_in_accepted = (curr_ids[0, -1].item() == self.tokenizer.eos_token_id)
+            if not has_eos_in_accepted and (curr_ids.shape[1] - prompt_len) < max_new_tokens:
+                authoritative_token = target_preds[:, n_accepted : n_accepted + 1]
+                curr_ids = torch.cat([curr_ids, authoritative_token], dim=-1)
+
+            # --- STEP D: CROP KV CACHES TO VALID LENGTH ---
+            # Target KV currently holds up to the end of `verify_input`.
+            # Valid processed cache length is `curr_ids.shape[1] - 1` (since the last token in curr_ids hasn't been passed through yet)
+            valid_cache_len = curr_ids.shape[1] - 1
+            crop_past_key_values(target_kv, valid_cache_len)
+            crop_past_key_values(draft_kv, min(draft_kv.get_seq_length(), valid_cache_len))
+
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start_time
+        generated_tokens = curr_ids.shape[1] - prompt_len
+        acceptance_rate = (total_accepted / total_drafted) * 100 if total_drafted > 0 else 0.0
+
+        return {
+            "output_ids": curr_ids,
+            "tokens_generated": generated_tokens,
+            "time_sec": elapsed,
+            "tps": generated_tokens / elapsed,
+            "acceptance_rate": acceptance_rate,
+            "tokens_per_target_step": generated_tokens / target_forward_passes
+        }
+
+    @torch.inference_mode()
+    def hf_assisted_generate(self, input_ids: torch.Tensor, max_new_tokens: int):
+        """Native Hugging Face Assisted Decoding for baseline reference."""
+        torch.cuda.synchronize()
+        start_time = time.perf_counter()
+
+        out_ids = self.target_model.generate(
+            input_ids,
+            assistant_model=self.draft_model,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=self.tokenizer.eos_token_id
+        )
+
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start_time
+        generated_tokens = out_ids.shape[1] - input_ids.shape[1]
+        return {
+            "output_ids": out_ids,
+            "tokens_generated": generated_tokens,
+            "time_sec": elapsed,
+            "tps": generated_tokens / elapsed
+        }
