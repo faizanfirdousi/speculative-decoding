@@ -57,19 +57,17 @@ class SpeculativeEngine:
         self.target_model = AutoModelForCausalLM.from_pretrained(
             self.cfg.TARGET_MODEL_ID,
             dtype=self.cfg.DTYPE,
-            device_map=self.cfg.DEVICE,
             attn_implementation=self.cfg.ATTN_IMPLEMENTATION,
             low_cpu_mem_usage=True
-        ).eval()
+        ).to(self.cfg.DEVICE).eval()
 
         print(f"[Init] Loading Draft Model ({self.cfg.DRAFT_MODEL_ID}) in {self.cfg.DTYPE}...")
         self.draft_model = AutoModelForCausalLM.from_pretrained(
             self.cfg.DRAFT_MODEL_ID,
             dtype=self.cfg.DTYPE,
-            device_map=self.cfg.DEVICE,
             attn_implementation=self.cfg.ATTN_IMPLEMENTATION,
             low_cpu_mem_usage=True
-        ).eval()
+        ).to(self.cfg.DEVICE).eval()
 
         vram_gb = torch.cuda.memory_allocated() / (1024 ** 3)
         total_vram_gb = getattr(self.cfg, "VRAM_TOTAL_GB", None)
