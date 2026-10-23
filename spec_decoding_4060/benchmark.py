@@ -288,8 +288,21 @@ def run_benchmarks(
     Preserves exact behavior of original RTX 4060 benchmark while adding
     profile selection, GPU validation, telemetry, and serialization.
     """
-    import torch
-    from tabulate import tabulate
+    try:
+        import torch
+        from tabulate import tabulate
+    except ImportError as exc:
+        print(
+            f"\n[FATAL] Missing required dependency: {exc}\n"
+            "Please ensure you have created and activated a virtual environment with required packages:\n\n"
+            "  python3 -m venv venv\n"
+            "  source venv/bin/activate\n"
+            "  pip install --upgrade pip\n"
+            "  pip install -r requirements.txt\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     from spec_decoding_4060.metrics import compare_greedy_outputs, summarize_timing_runs
 
     # 1. Hardware Detection
