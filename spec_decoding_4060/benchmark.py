@@ -16,8 +16,17 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-# Enable expandable segments to avoid CUDA memory fragmentation
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# On WSL2, expandable_segments is unsupported by the virtualized driver and causes
+# cuMemSetAccess / cuMemMap unknown driver errors. Unconditionally strip it if set.
+if "PYTORCH_CUDA_ALLOC_CONF" in os.environ:
+    _clean_parts = [
+        _p for _p in os.environ["PYTORCH_CUDA_ALLOC_CONF"].split(",")
+        if "expandable_segments" not in _p.lower()
+    ]
+    if _clean_parts:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(_clean_parts)
+    else:
+        os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
 
 # Ensure repository root is on sys.path so modules in spec_decoding_* can be imported
 _CURRENT_DIR = Path(__file__).resolve().parent
