@@ -16,6 +16,9 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
+# Enable expandable segments to avoid CUDA memory fragmentation
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 # Ensure repository root is on sys.path so modules in spec_decoding_* can be imported
 _CURRENT_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _CURRENT_DIR.parent if _CURRENT_DIR.name.startswith("spec_decoding_") else _CURRENT_DIR
@@ -217,7 +220,10 @@ def save_results(
         "hf_assisted_tps",
         "speedup",
         "acceptance_rate_pct",
-        "tokens_per_target_step",
+        "output_tokens_per_target_forward",
+        "accepted_tokens_per_verification_cycle",
+        "target_forward_passes",
+        "verification_cycles",
         "exact_match",
         "prompt_tokens",
         "generated_tokens",
@@ -237,7 +243,10 @@ def save_results(
             f"{item['hf_assisted']['tps']:.2f}",
             f"{item['custom_speculative']['speedup']:.2f}",
             f"{item['custom_speculative']['acceptance_rate']:.1f}",
-            f"{item['custom_speculative']['tokens_per_target_step']:.2f}",
+            f"{item['custom_speculative'].get('output_tokens_per_target_forward', item['custom_speculative'].get('tokens_per_target_step', 0)):.2f}",
+            f"{item['custom_speculative'].get('accepted_tokens_per_verification_cycle', 0.0):.2f}",
+            item["custom_speculative"].get("target_forward_passes", 0),
+            item["custom_speculative"].get("verification_cycles", 0),
             "PASS" if item["exact_match"] else "MISMATCH",
             item["prompt_tokens"],
             item["generated_tokens"],
@@ -265,10 +274,11 @@ def save_results(
 
 
 def run_benchmarks(
-    gpu: str = "rtx4060",
+    gpu: str = "auto",
     allow_mismatch: bool = False,
     gamma: Optional[int] = None,
     max_new_tokens: Optional[int] = None,
+    repetitions: Optional[int] = None,
     output_dir: Optional[str] = None,
     save_output: bool = True,
     dry_run: bool = False,
@@ -280,9 +290,10 @@ def run_benchmarks(
     """
     import torch
     from tabulate import tabulate
+    from spec_decoding_4060.metrics import compare_greedy_outputs, summarize_timing_runs
 
     # 1. Hardware Detection
-    hardware = detect_gpu_hardware()
+    hardware = detect_gpu_hardware(device_str=os.environ.get("SPEC_BENCH_DEVICE", "cuda:0"))
 
     # 2. Profile Selection
     profile_name = gpu
@@ -295,10 +306,14 @@ def run_benchmarks(
         overrides["GAMMA"] = gamma
     if max_new_tokens is not None:
         overrides["MAX_NEW_TOKENS"] = max_new_tokens
+    if repetitions is not None:
+        overrides["MEASURED_REPETITIONS"] = repetitions
     if output_dir is not None:
         overrides["OUTPUT_DIR"] = output_dir
 
     cfg = load_profile_config(profile_name, overrides)
+    measured_reps = max(1, int(getattr(cfg, "MEASURED_REPETITIONS", 1)))
+    bench_seed = int(getattr(cfg, "BENCHMARK_SEED", 42))
 
     # 3. Validation
     is_match = validate_profile_gpu(cfg, profile_name, hardware, allow_mismatch=allow_mismatch)
@@ -319,6 +334,8 @@ def run_benchmarks(
     print(f"  Detected Hardware   : {hardware['gpu_name']} ({hardware['total_vram_gb']:.2f} GB VRAM)")
     print(f"  Available Memory    : {hardware['free_vram_gb']:.2f} GB free at idle")
     print(f"  PyTorch / CUDA      : {hardware['pytorch_version']} | CUDA {hardware['pytorch_cuda_version']}")
+    print(f"  Measured Reps       : {measured_reps} (median tok/s)")
+    print(f"  Benchmark Seed      : {bench_seed}")
     print(f"  Git Commit          : {git_commit}")
     print(f"  Output Directory    : {out_dir}")
     print("=" * 70 + "\n")
@@ -337,13 +354,17 @@ def run_benchmarks(
     from spec_decoding_4060.engine import SpeculativeEngine
 
     engine = SpeculativeEngine(cfg)
+    torch.manual_seed(bench_seed)
 
-    # 5. CUDA Warm-up Pass
+    # 5. CUDA Warm-up Pass (all three decode paths; excluded from timed runs)
     warmup_tokens = getattr(cfg, "WARMUP_TOKENS", 16)
     warmup_prompt = getattr(cfg, "WARMUP_PROMPT", "Say hello in one word.")
-    print(f"[Warm-up] Running CUDA kernel warm-up pass ({warmup_prompt!r}, tokens={warmup_tokens})...")
+    print(f"[Warm-up] Running CUDA kernel warm-up ({warmup_prompt!r}, tokens={warmup_tokens})...")
     warmup_ids = engine.format_prompt(warmup_prompt)
+    _ = engine.autoregressive_generate(warmup_ids, max_new_tokens=warmup_tokens)
     _ = engine.custom_speculative_generate(warmup_ids, max_new_tokens=warmup_tokens, gamma=cfg.GAMMA)
+    _ = engine.hf_assisted_generate(warmup_ids, max_new_tokens=warmup_tokens)
+    torch.cuda.synchronize()
     print("[Warm-up] Complete.\n")
 
     summary_rows = []
@@ -359,31 +380,60 @@ def run_benchmarks(
         print(f"Benchmark {idx}/{len(cfg.PROMPTS)}: {name} (Prompt tokens: {prompt_len})")
         print("=" * 70)
 
-        # Run 1: Standard Autoregressive Baseline
-        ar_res = engine.autoregressive_generate(input_ids, cfg.MAX_NEW_TOKENS)
-        print(f"  -> Baseline Autoregressive : {ar_res['tps']:.2f} tok/s ({ar_res['time_sec']:.2f}s)")
+        ar_runs: List[Dict[str, float]] = []
+        spec_runs: List[Dict[str, float]] = []
+        hf_runs: List[Dict[str, float]] = []
+        ar_res: Optional[Dict[str, Any]] = None
+        spec_res: Optional[Dict[str, Any]] = None
+        hf_res: Optional[Dict[str, Any]] = None
 
-        # Run 2: Custom Speculative Decoding
-        spec_res = engine.custom_speculative_generate(input_ids, cfg.MAX_NEW_TOKENS, cfg.GAMMA)
-        print(f"  -> Custom Speculative (K={cfg.GAMMA}): {spec_res['tps']:.2f} tok/s ({spec_res['time_sec']:.2f}s)")
+        for rep in range(measured_reps):
+            torch.cuda.reset_peak_memory_stats()
+            ar_res = engine.autoregressive_generate(input_ids, cfg.MAX_NEW_TOKENS)
+            spec_res = engine.custom_speculative_generate(input_ids, cfg.MAX_NEW_TOKENS, cfg.GAMMA)
+            hf_res = engine.hf_assisted_generate(input_ids, cfg.MAX_NEW_TOKENS)
+            ar_runs.append({"tps": ar_res["tps"], "time_sec": ar_res["time_sec"]})
+            spec_runs.append({"tps": spec_res["tps"], "time_sec": spec_res["time_sec"]})
+            hf_runs.append({"tps": hf_res["tps"], "time_sec": hf_res["time_sec"]})
 
-        # Run 3: Hugging Face Native Assisted Generation
-        hf_res = engine.hf_assisted_generate(input_ids, cfg.MAX_NEW_TOKENS)
-        print(f"  -> HF Native Assisted      : {hf_res['tps']:.2f} tok/s ({hf_res['time_sec']:.2f}s)")
+        assert ar_res is not None and spec_res is not None and hf_res is not None
+        ar_summary = summarize_timing_runs(ar_runs)
+        spec_summary = summarize_timing_runs(spec_runs)
+        hf_summary = summarize_timing_runs(hf_runs)
 
-        # Exact Output Equivalence Verification
-        exact_match = torch.equal(ar_res["output_ids"], spec_res["output_ids"])
-        speedup = spec_res["tps"] / ar_res["tps"] if ar_res["tps"] > 0 else 0.0
-        hf_speedup = hf_res["tps"] / ar_res["tps"] if ar_res["tps"] > 0 else 0.0
+        print(
+            f"  -> Baseline Autoregressive : {ar_summary['tps']:.2f} tok/s "
+            f"(median of {measured_reps}, σ≈{ar_summary.get('tps_std', 0):.2f})"
+        )
+        print(
+            f"  -> Custom Speculative (K={cfg.GAMMA}): {spec_summary['tps']:.2f} tok/s "
+            f"(median of {measured_reps})"
+        )
+        print(f"  -> HF Native Assisted      : {hf_summary['tps']:.2f} tok/s (median of {measured_reps})")
+
+        equiv = compare_greedy_outputs(ar_res["output_ids"], spec_res["output_ids"], prompt_len)
+        exact_match = equiv["exact_match"]
+        if not exact_match and "first_divergence" in equiv:
+            div = equiv["first_divergence"]
+            print(
+                f"  !! Greedy mismatch at output token {div['output_token_index']}: "
+                f"baseline id={div['baseline_token_id']} vs spec id={div['speculative_token_id']}"
+            )
+
+        speedup = spec_summary["tps"] / ar_summary["tps"] if ar_summary["tps"] > 0 else 0.0
+        hf_speedup = hf_summary["tps"] / ar_summary["tps"] if ar_summary["tps"] > 0 else 0.0
+        otptf = spec_res.get(
+            "output_tokens_per_target_forward", spec_res.get("tokens_per_target_step", 0.0)
+        )
 
         summary_rows.append([
             name,
-            f"{ar_res['tps']:.2f} t/s",
-            f"{spec_res['tps']:.2f} t/s",
-            f"{hf_res['tps']:.2f} t/s",
+            f"{ar_summary['tps']:.2f} t/s",
+            f"{spec_summary['tps']:.2f} t/s",
+            f"{hf_summary['tps']:.2f} t/s",
             f"{speedup:.2f}x",
             f"{spec_res['acceptance_rate']:.1f}%",
-            f"{spec_res['tokens_per_target_step']:.2f}",
+            f"{otptf:.2f}",
             "PASS" if exact_match else "MISMATCH",
         ])
 
@@ -393,32 +443,43 @@ def run_benchmarks(
             "prompt_tokens": prompt_len,
             "generated_tokens": spec_res["tokens_generated"],
             "baseline_ar": {
-                "tps": ar_res["tps"],
-                "time_sec": ar_res["time_sec"],
+                "tps": ar_summary["tps"],
+                "time_sec": ar_summary["time_sec"],
                 "tokens_generated": ar_res["tokens_generated"],
+                "raw_runs": ar_runs,
             },
             "custom_speculative": {
-                "tps": spec_res["tps"],
-                "time_sec": spec_res["time_sec"],
+                "tps": spec_summary["tps"],
+                "time_sec": spec_summary["time_sec"],
                 "speedup": speedup,
                 "acceptance_rate": spec_res["acceptance_rate"],
-                "tokens_per_target_step": spec_res["tokens_per_target_step"],
+                "tokens_per_target_step": otptf,
+                "output_tokens_per_target_forward": otptf,
+                "accepted_tokens_per_verification_cycle": spec_res.get(
+                    "accepted_tokens_per_verification_cycle", 0.0
+                ),
                 "total_drafted": spec_res.get("total_drafted", 0),
                 "total_accepted": spec_res.get("total_accepted", 0),
                 "target_forward_passes": spec_res.get("target_forward_passes", 0),
+                "verification_cycles": spec_res.get("verification_cycles", 0),
+                "raw_runs": spec_runs,
             },
             "hf_assisted": {
-                "tps": hf_res["tps"],
-                "time_sec": hf_res["time_sec"],
+                "tps": hf_summary["tps"],
+                "time_sec": hf_summary["time_sec"],
                 "speedup": hf_speedup,
                 "tokens_generated": hf_res["tokens_generated"],
+                "raw_runs": hf_runs,
             },
             "exact_match": exact_match,
+            "greedy_equivalence": equiv,
         })
         print()
 
     peak_vram_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+    peak_vram_reserved_gb = torch.cuda.max_memory_reserved() / (1024 ** 3)
     total_ceiling_gb = getattr(cfg, "VRAM_TOTAL_GB", hardware["total_vram_gb"])
+    curr_free_bytes, curr_total_bytes = torch.cuda.mem_get_info()
 
     # 7. Print Formatted Table
     print(f"\n================ FINAL {profile_name.upper()} BENCHMARK RESULTS ================")
@@ -429,11 +490,14 @@ def run_benchmarks(
         "HF Assisted",
         "Speedup",
         "Accept Rate",
-        "Tok/Target Step",
+        "Out Tok / Target Fwd",
         "Exact Match",
     ]
     print(tabulate(summary_rows, headers=headers, tablefmt="fancy_grid"))
-    print(f"\n[Telemetry] Peak GPU VRAM Allocated: {peak_vram_gb:.2f} GB / {total_ceiling_gb:.2f} GB")
+    print(
+        f"\n[Telemetry] Peak PyTorch VRAM — allocated: {peak_vram_gb:.2f} GB, "
+        f"reserved: {peak_vram_reserved_gb:.2f} GB | System free VRAM: {curr_free_bytes / (1024**3):.2f} GB / {curr_total_bytes / (1024**3):.2f} GB"
+    )
 
     # 8. Compile Results Payload
     results_payload = {
@@ -454,10 +518,33 @@ def run_benchmarks(
             "max_new_tokens": cfg.MAX_NEW_TOKENS,
             "warmup_iterations": getattr(cfg, "WARMUP_ITERATIONS", 1),
             "warmup_tokens": warmup_tokens,
+            "measured_repetitions": measured_reps,
+            "benchmark_seed": bench_seed,
+        },
+        "metric_definitions": {
+            "acceptance_rate": (
+                "100 * total_accepted / total_drafted; draft proposals only, per verification cycle."
+            ),
+            "output_tokens_per_target_forward": (
+                "Generated output tokens divided by target_model forward passes "
+                "(includes prompt prefill and each parallel verify forward)."
+            ),
+            "accepted_tokens_per_verification_cycle": (
+                "Total accepted draft tokens divided by verification cycles (target verify passes after prefill)."
+            ),
+            "target_forward_passes": "Count of target_model(...) calls during custom speculative generation.",
+            "verification_cycles": "Target verify forwards after prefill (= target_forward_passes - 1).",
+            "exact_match": (
+                "True iff baseline greedy target output token IDs equal custom speculative output IDs "
+                "(full sequence including prompt)."
+            ),
+            "throughput_tps": "Generated output tokens / wall time; CUDA sync before/after timed region.",
         },
         "benchmarks": benchmarks_data,
         "telemetry": {
             "peak_vram_allocated_gb": peak_vram_gb,
+            "peak_vram_reserved_gb": peak_vram_reserved_gb,
+            "system_free_vram_gb": curr_free_bytes / (1024 ** 3),
             "total_vram_gb": total_ceiling_gb,
         },
     }
@@ -481,7 +568,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--gpu",
         "--profile",
         dest="gpu",
-        default="rtx4060",
+        default="auto",
         choices=["rtx4060", "rtx4000", "auto"],
         help="GPU benchmark profile to execute ('rtx4060', 'rtx4000', or 'auto' detection).",
     )
@@ -512,6 +599,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Override maximum generated tokens per prompt (default: from profile config).",
+    )
+    parser.add_argument(
+        "--repetitions",
+        type=int,
+        default=None,
+        help="Override measured timing repetitions per task (median reported).",
     )
     parser.add_argument(
         "--output-dir",
@@ -582,6 +675,7 @@ def main():
         allow_mismatch=args.allow_mismatch,
         gamma=args.gamma,
         max_new_tokens=args.max_new_tokens,
+        repetitions=args.repetitions,
         output_dir=args.output_dir,
         save_output=not args.no_save,
         dry_run=args.dry_run,

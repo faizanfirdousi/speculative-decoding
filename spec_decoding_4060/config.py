@@ -23,6 +23,11 @@ class SpecConfig:
     WARMUP_ITERATIONS: int = 1
     WARMUP_TOKENS: int = 16
     WARMUP_PROMPT: str = "Say hello in one word."
+    MEASURED_REPETITIONS: int = 1
+    BENCHMARK_SEED: int = 42
+    CUDNN_BENCHMARK: bool = False
+    ALLOW_TF32: bool = True
+    TORCH_DETERMINISTIC: bool = False
     OUTPUT_DIR: str = "results/rtx4060"
     
     # Benchmark Prompts (High acceptance rate & standard reasoning)

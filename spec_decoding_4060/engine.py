@@ -3,6 +3,12 @@ import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from kv_cache_utils import crop_past_key_values
+from spec_decoding_4060.metrics import (
+    acceptance_rate_pct,
+    accepted_tokens_per_verification_cycle,
+    output_tokens_per_target_forward,
+    validate_speculative_counters,
+)
 
 # Patch upstream HF AssistedCandidateGenerator bug in transformers >= 5.x
 # where assistant KV cache is not properly rolled back when draft tokens are rejected
@@ -35,6 +41,14 @@ class SpeculativeEngine:
             torch.cuda.set_device(device_idx)
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
+            if getattr(self.cfg, "CUDNN_BENCHMARK", False):
+                torch.backends.cudnn.benchmark = True
+            if getattr(self.cfg, "ALLOW_TF32", True):
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+            if getattr(self.cfg, "TORCH_DETERMINISTIC", False):
+                torch.backends.cudnn.deterministic = True
+                torch.use_deterministic_algorithms(True)
 
         print(f"[Init] Loading Tokenizer from {self.cfg.TARGET_MODEL_ID}...")
         self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.TARGET_MODEL_ID)
@@ -139,7 +153,8 @@ class SpeculativeEngine:
 
         total_drafted = 0
         total_accepted = 0
-        target_forward_passes = 1
+        target_forward_passes = 1  # initial prompt prefill
+        verification_cycles = 0
 
         # 2. Main Speculative Loop
         while (curr_ids.shape[1] - prompt_len) < max_new_tokens:
@@ -174,6 +189,7 @@ class SpeculativeEngine:
             t_out = self.target_model(input_ids=verify_input, past_key_values=target_kv, use_cache=True)
             target_kv = t_out.past_key_values
             target_forward_passes += 1
+            verification_cycles += 1
 
             # Target predictions for each of the drafted positions + 1 bonus position
             target_preds = torch.argmax(t_out.logits, dim=-1)  # Shape: (1, current_gamma + 1)
@@ -211,7 +227,18 @@ class SpeculativeEngine:
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start_time
         generated_tokens = curr_ids.shape[1] - prompt_len
-        acceptance_rate = (total_accepted / total_drafted) * 100 if total_drafted > 0 else 0.0
+        acceptance_rate = acceptance_rate_pct(total_accepted, total_drafted)
+        otptf = output_tokens_per_target_forward(generated_tokens, target_forward_passes)
+        atpvc = accepted_tokens_per_verification_cycle(total_accepted, verification_cycles)
+
+        validate_speculative_counters(
+            output_tokens=generated_tokens,
+            max_new_tokens=max_new_tokens,
+            total_drafted=total_drafted,
+            total_accepted=total_accepted,
+            target_forward_passes=target_forward_passes,
+            verification_cycles=verification_cycles,
+        )
 
         return {
             "output_ids": curr_ids,
@@ -219,10 +246,13 @@ class SpeculativeEngine:
             "time_sec": elapsed,
             "tps": generated_tokens / elapsed,
             "acceptance_rate": acceptance_rate,
-            "tokens_per_target_step": generated_tokens / target_forward_passes,
+            "tokens_per_target_step": otptf,
+            "output_tokens_per_target_forward": otptf,
+            "accepted_tokens_per_verification_cycle": atpvc,
             "total_drafted": total_drafted,
             "total_accepted": total_accepted,
-            "target_forward_passes": target_forward_passes
+            "target_forward_passes": target_forward_passes,
+            "verification_cycles": verification_cycles,
         }
 
     @torch.inference_mode()

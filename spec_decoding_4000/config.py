@@ -37,14 +37,19 @@ class SpecConfig4000:
     DTYPE: torch.dtype = torch.bfloat16          # Ada Lovelace Tensor Core native
     ATTN_IMPLEMENTATION: str = "sdpa"            # PyTorch SDPA
 
-    # ---- Speculative decoding hyperparameters (identical to 4060) -------
-    GAMMA: int = 5                               # draft lookahead K
+    # ---- Speculative decoding (tuned for ~20 GB VRAM / higher bandwidth) -
+    GAMMA: int = 8                               # larger K: more parallel verify work per step
     MAX_NEW_TOKENS: int = 256
 
     # ---- Benchmark Execution Settings ------------------------------------
     WARMUP_ITERATIONS: int = 1
     WARMUP_TOKENS: int = 16
     WARMUP_PROMPT: str = "Say hello in one word."
+    MEASURED_REPETITIONS: int = 3                # median over repetitions for stable tok/s
+    BENCHMARK_SEED: int = 42
+    CUDNN_BENCHMARK: bool = True                 # fixed-shape decode; improves SDPA matmul selection
+    ALLOW_TF32: bool = True                      # Ada Lovelace 4th Gen Tensor Core TF32 acceleration
+    TORCH_DETERMINISTIC: bool = False
     OUTPUT_DIR: str = "results/rtx4000"
 
     # ---- Benchmark prompts (identical to 4060 for fair comparison) ------
