@@ -403,6 +403,9 @@ def run_benchmarks(
         print(f"Benchmark {idx}/{len(cfg.PROMPTS)}: {name} (Prompt tokens: {prompt_len})")
         print("=" * 70)
 
+        # Reset seed per prompt for reproducibility
+        torch.manual_seed(bench_seed + idx)
+
         ar_runs: List[Dict[str, float]] = []
         spec_runs: List[Dict[str, float]] = []
         hf_runs: List[Dict[str, float]] = []
@@ -455,12 +458,14 @@ def run_benchmarks(
             "output_tokens_per_target_forward", spec_res.get("tokens_per_target_step", 0.0)
         )
 
+        speedup_label = f"{speedup:.2f}x {'FASTER' if speedup >= 1.0 else 'SLOWER'}"
+
         summary_rows.append([
             name,
             f"{ar_summary['tps']:.2f} t/s",
             f"{spec_summary['tps']:.2f} t/s",
             f"{hf_summary['tps']:.2f} t/s",
-            f"{speedup:.2f}x",
+            speedup_label,
             f"{spec_res['acceptance_rate']:.1f}%",
             f"{otptf:.2f}",
             "PASS" if exact_match else "MISMATCH",

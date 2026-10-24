@@ -17,13 +17,13 @@ class SpecConfig:
     
     # Speculative Decoding Hyperparameters
     GAMMA: int = 5                       # Lookahead K (5 is optimal for 0.5B -> 3B)
-    MAX_NEW_TOKENS: int = 256
+    MAX_NEW_TOKENS: int = 512
 
     # Benchmark Execution Settings
     WARMUP_ITERATIONS: int = 1
-    WARMUP_TOKENS: int = 16
+    WARMUP_TOKENS: int = 64
     WARMUP_PROMPT: str = "Say hello in one word."
-    MEASURED_REPETITIONS: int = 1
+    MEASURED_REPETITIONS: int = 5
     BENCHMARK_SEED: int = 42
     CUDNN_BENCHMARK: bool = False
     ALLOW_TF32: bool = True

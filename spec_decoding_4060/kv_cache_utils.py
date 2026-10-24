@@ -8,14 +8,14 @@ def crop_past_key_values(past_key_values: DynamicCache, max_length: int) -> Dyna
     if past_key_values is None:
         return None
     
+    curr_len = past_key_values.get_seq_length()
+    if curr_len <= max_length:
+        return past_key_values
+
     # transformers >= 4.40 supports native .crop() on DynamicCache
+    # .crop() takes a negative int = number of entries to remove from the end
     if hasattr(past_key_values, "crop"):
-        curr_len = past_key_values.get_seq_length()
-        if curr_len > max_length:
-            try:
-                past_key_values.crop(-(curr_len - max_length))
-            except Exception:
-                past_key_values.crop(max_length)
+        past_key_values.crop(-(curr_len - max_length))
         return past_key_values
     
     # Fallback manual slicing for older DynamicCache versions
@@ -25,3 +25,4 @@ def crop_past_key_values(past_key_values: DynamicCache, max_length: int) -> Dyna
     if hasattr(past_key_values, "_seen_tokens"):
         past_key_values._seen_tokens = max_length
     return past_key_values
+

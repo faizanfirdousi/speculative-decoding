@@ -192,7 +192,7 @@ class SpeculativeEngine:
         target_out = self.target_model(input_ids=curr_ids, past_key_values=target_kv, use_cache=True)
         target_kv = target_out.past_key_values
         
-        draft_out = self.draft_model(input_ids=curr_ids[:, :-1], past_key_values=draft_kv, use_cache=True)
+        draft_out = self.draft_model(input_ids=curr_ids, past_key_values=draft_kv, use_cache=True)
         draft_kv = draft_out.past_key_values
 
         # First token comes directly from the target model's prefill pass
