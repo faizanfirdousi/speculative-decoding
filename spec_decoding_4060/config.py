@@ -17,7 +17,7 @@ class SpecConfig:
     
     # Speculative Decoding Hyperparameters
     GAMMA: int = 5                       # Lookahead K (5 is optimal for 0.5B -> 3B)
-    MAX_NEW_TOKENS: int = 512
+    MAX_NEW_TOKENS: int = 256
 
     # Benchmark Execution Settings
     WARMUP_ITERATIONS: int = 1
