@@ -110,6 +110,9 @@ python benchmark.py --gpu rtx4000
 # Run a dry-run check without loading models
 python benchmark.py --dry-run
 
+# Run benchmarks with live token streaming to terminal
+python benchmark.py --stream
+
 # Run RTX 4000 configuration on a different GPU for testing
 python benchmark.py --gpu rtx4000 --allow-mismatch
 
@@ -127,6 +130,24 @@ python benchmark.py --show-gpu
 
 # List available profiles
 python benchmark.py --list-profiles
+```
+
+## Live Interactive Streaming & Speed Monitor
+
+Watch tokens generate live directly on your terminal in real-time with continuous speed telemetry (tokens/sec) and draft acceptance stats:
+
+```bash
+# 1. Launch interactive session (preset prompts or custom text input)
+python stream_demo.py
+
+# 2. Side-by-side comparison (Baseline AR at ~35 tok/s vs Speculative at ~78 tok/s)
+python stream_demo.py --prompt "Explain quantum computing in simple terms" --mode compare
+
+# 3. Speculative mode with visual color coding (Cyan = Draft accepted, Green = Target authoritative)
+python stream_demo.py --prompt "Write a Binary Search Tree in Python" --mode spec --color
+
+# 4. Custom lookahead K and token limits
+python stream_demo.py --prompt "Explain CPU caches" --gamma 5 --max-new-tokens 200
 ```
 
 ## Metric Definitions

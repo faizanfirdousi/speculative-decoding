@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Optional
 import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
@@ -9,6 +9,14 @@ from spec_decoding_4060.metrics import (
     output_tokens_per_target_forward,
     validate_speculative_counters,
 )
+try:
+    from spec_decoding_4060.streamer import LiveTokenStreamer
+except ImportError:
+    try:
+        from streamer import LiveTokenStreamer
+    except ImportError:
+        LiveTokenStreamer = None
+
 
 # Patch upstream HF AssistedCandidateGenerator bug in transformers >= 5.x
 # where assistant KV cache is not properly rolled back when draft tokens are rejected
@@ -90,10 +98,27 @@ class SpeculativeEngine:
         return self.tokenizer(text, return_tensors="pt").input_ids.to(self.cfg.DEVICE)
 
     @torch.inference_mode()
-    def autoregressive_generate(self, input_ids: torch.Tensor, max_new_tokens: int):
+    def autoregressive_generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        stream: bool = False,
+        streamer: Any = None,
+        colorize: bool = False,
+    ):
         """Standard token-by-token greedy decoding on the Target Model."""
+        if stream and streamer is None and LiveTokenStreamer is not None:
+            streamer = LiveTokenStreamer(
+                self.tokenizer,
+                label="Baseline Autoregressive (3B)",
+                is_speculative=False,
+                colorize=colorize,
+            )
+
         torch.cuda.synchronize()
         start_time = time.perf_counter()
+        if streamer is not None and hasattr(streamer, "start"):
+            streamer.start()
 
         past_kv = DynamicCache()
         curr_ids = input_ids.clone()
@@ -110,12 +135,19 @@ class SpeculativeEngine:
             curr_ids = torch.cat([curr_ids, next_token], dim=-1)
             next_input = next_token
 
+            if streamer is not None and hasattr(streamer, "put_token"):
+                streamer.put_token(next_token.item())
+
             if next_token.item() == self.tokenizer.eos_token_id:
                 break
 
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start_time
         generated_tokens = curr_ids.shape[1] - input_ids.shape[1]
+
+        if streamer is not None and hasattr(streamer, "end"):
+            streamer.end()
+
         return {
             "output_ids": curr_ids,
             "tokens_generated": generated_tokens,
@@ -124,13 +156,31 @@ class SpeculativeEngine:
         }
 
     @torch.inference_mode()
-    def custom_speculative_generate(self, input_ids: torch.Tensor, max_new_tokens: int, gamma: int):
+    def custom_speculative_generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        gamma: int,
+        stream: bool = False,
+        streamer: Any = None,
+        colorize: bool = False,
+    ):
         """
         Custom Greedy Speculative Decoding with KV-Cache Rollback.
         Guarantees zero prompt recomputation and 100% mathematical equivalence to Target.
         """
+        if stream and streamer is None and LiveTokenStreamer is not None:
+            streamer = LiveTokenStreamer(
+                self.tokenizer,
+                label=f"Custom Speculative (0.5B->3B, K={gamma})",
+                is_speculative=True,
+                colorize=colorize,
+            )
+
         torch.cuda.synchronize()
         start_time = time.perf_counter()
+        if streamer is not None and hasattr(streamer, "start"):
+            streamer.start()
 
         target_kv = DynamicCache()
         draft_kv = DynamicCache()
@@ -148,6 +198,9 @@ class SpeculativeEngine:
         # First token comes directly from the target model's prefill pass
         first_token = torch.argmax(target_out.logits[:, -1, :], dim=-1, keepdim=True)
         curr_ids = torch.cat([curr_ids, first_token], dim=-1)
+
+        if streamer is not None and hasattr(streamer, "put_token"):
+            streamer.put_token(first_token.item())
 
         total_drafted = 0
         total_accepted = 0
@@ -204,16 +257,25 @@ class SpeculativeEngine:
 
             total_accepted += n_accepted
 
-            # Accepted tokens from draft
+            accepted_chunk = None
             if n_accepted > 0:
-                curr_ids = torch.cat([curr_ids, draft_seq[:, :n_accepted]], dim=-1)
+                accepted_chunk = draft_seq[:, :n_accepted]
+                curr_ids = torch.cat([curr_ids, accepted_chunk], dim=-1)
 
             # Always append the target model's authoritative token at position `n_accepted`
             # (Either the correction token if rejected early, or the bonus (K+1)-th token if all K accepted!)
+            authoritative_token = None
             has_eos_in_accepted = (curr_ids[0, -1].item() == self.tokenizer.eos_token_id)
             if not has_eos_in_accepted and (curr_ids.shape[1] - prompt_len) < max_new_tokens:
                 authoritative_token = target_preds[:, n_accepted : n_accepted + 1]
                 curr_ids = torch.cat([curr_ids, authoritative_token], dim=-1)
+
+            if streamer is not None and hasattr(streamer, "put_speculative_chunk"):
+                streamer.put_speculative_chunk(
+                    accepted_tokens=accepted_chunk,
+                    authoritative_token=authoritative_token,
+                    drafted_count=current_gamma,
+                )
 
             # --- STEP D: CROP KV CACHES TO VALID LENGTH ---
             # Target KV currently holds up to the end of `verify_input`.
@@ -225,6 +287,10 @@ class SpeculativeEngine:
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start_time
         generated_tokens = curr_ids.shape[1] - prompt_len
+
+        if streamer is not None and hasattr(streamer, "end"):
+            streamer.end()
+
         acceptance_rate = acceptance_rate_pct(total_accepted, total_drafted)
         otptf = output_tokens_per_target_forward(generated_tokens, target_forward_passes)
         atpvc = accepted_tokens_per_verification_cycle(total_accepted, verification_cycles)
@@ -254,17 +320,33 @@ class SpeculativeEngine:
         }
 
     @torch.inference_mode()
-    def hf_assisted_generate(self, input_ids: torch.Tensor, max_new_tokens: int):
+    def hf_assisted_generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        stream: bool = False,
+        streamer: Any = None,
+    ):
         """Native Hugging Face Assisted Decoding for baseline reference."""
+        if stream and streamer is None:
+            from transformers import TextStreamer
+            streamer = TextStreamer(self.tokenizer, skip_prompt=True)
+
         torch.cuda.synchronize()
         start_time = time.perf_counter()
 
+        gen_kwargs = {
+            "assistant_model": self.draft_model,
+            "max_new_tokens": max_new_tokens,
+            "do_sample": False,
+            "pad_token_id": self.tokenizer.eos_token_id,
+        }
+        if streamer is not None:
+            gen_kwargs["streamer"] = streamer
+
         out_ids = self.target_model.generate(
             input_ids,
-            assistant_model=self.draft_model,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=self.tokenizer.eos_token_id
+            **gen_kwargs
         )
 
         torch.cuda.synchronize()

@@ -291,6 +291,7 @@ def run_benchmarks(
     output_dir: Optional[str] = None,
     save_output: bool = True,
     dry_run: bool = False,
+    stream: bool = False,
 ) -> Dict[str, Any]:
     """
     Main benchmark execution entry point.
@@ -411,8 +412,14 @@ def run_benchmarks(
 
         for rep in range(measured_reps):
             torch.cuda.reset_peak_memory_stats()
-            ar_res = engine.autoregressive_generate(input_ids, cfg.MAX_NEW_TOKENS)
-            spec_res = engine.custom_speculative_generate(input_ids, cfg.MAX_NEW_TOKENS, cfg.GAMMA)
+            if stream:
+                print(f"\n[Repetition {rep + 1}/{measured_reps}] Streaming Baseline AR:")
+            ar_res = engine.autoregressive_generate(input_ids, cfg.MAX_NEW_TOKENS, stream=stream)
+            if stream:
+                print(f"\n[Repetition {rep + 1}/{measured_reps}] Streaming Custom Speculative (K={cfg.GAMMA}):")
+            spec_res = engine.custom_speculative_generate(
+                input_ids, cfg.MAX_NEW_TOKENS, cfg.GAMMA, stream=stream
+            )
             hf_res = engine.hf_assisted_generate(input_ids, cfg.MAX_NEW_TOKENS)
             ar_runs.append({"tps": ar_res["tps"], "time_sec": ar_res["time_sec"]})
             spec_runs.append({"tps": spec_res["tps"], "time_sec": spec_res["time_sec"]})
@@ -644,6 +651,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Validate environment and profile settings without loading model weights.",
     )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream generated tokens live to the terminal during benchmarks.",
+    )
     return parser
 
 
@@ -701,6 +713,7 @@ def main():
         output_dir=args.output_dir,
         save_output=not args.no_save,
         dry_run=args.dry_run,
+        stream=args.stream,
     )
 
 
