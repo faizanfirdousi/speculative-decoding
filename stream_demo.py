@@ -131,21 +131,35 @@ def run_stream_session(
             colorize=colorize,
         )
 
-    if mode == "compare":
         ar_tps = ar_res["tps"]
         spec_tps = spec_res["tps"]
         speedup = spec_tps / ar_tps if ar_tps > 0 else 0.0
         acc_rate = spec_res["acceptance_rate"]
         otptf = spec_res.get("output_tokens_per_target_forward", 0.0)
 
+        ar_inf_tps = ar_res.get("inference_tps", ar_tps)
+        spec_inf_tps = spec_res.get("inference_tps", spec_tps)
+        inf_speedup = spec_inf_tps / ar_inf_tps if ar_inf_tps > 0 else 0.0
+        ar_disp_ms = ar_res.get("display_time_sec", 0.0) * 1000.0
+        spec_disp_ms = spec_res.get("display_time_sec", 0.0) * 1000.0
+
         print("═" * 72)
-        print("  📊 COMPARISON SUMMARY (Live Speed & Efficiency)")
+        print("  📊 COMPARISON SUMMARY (Live Speed & Latency Breakdown)")
         print("═" * 72)
-        print(f"  • Baseline Autoregressive (3B) : \033[1m{ar_tps:6.2f} tokens/sec\033[0m ({ar_res['time_sec']:.2f}s)")
-        print(f"  • Speculative Decoding (K={gamma})   : \033[1;32m{spec_tps:6.2f} tokens/sec\033[0m ({spec_res['time_sec']:.2f}s)")
-        print(f"  • Effective Acceleration       : \033[1;32m{speedup:6.2f}x FASTER\033[0m ⚡")
-        print(f"  • Draft Model Acceptance Rate  : \033[1;36m{acc_rate:6.1f}%\033[0m")
-        print(f"  • Output Tok / Target Forward  : \033[1m{otptf:6.2f} tokens/fwd\033[0m")
+        print("  • PURE MODEL INFERENCE (Excluding Terminal/Display I/O):")
+        print(f"      Baseline AR (3B)         : \033[1m{ar_inf_tps:6.2f} tokens/sec\033[0m ({ar_res.get('inference_time_sec', ar_res['time_sec']):.2f}s)")
+        print(f"      Speculative (K={gamma})       : \033[1;32m{spec_inf_tps:6.2f} tokens/sec\033[0m ({spec_res.get('inference_time_sec', spec_res['time_sec']):.2f}s)")
+        print(f"      Inference Acceleration   : \033[1;32m{inf_speedup:6.2f}x FASTER\033[0m ⚡")
+        print("  • TOTAL WALL-CLOCK STREAMING (End-to-End User Experience):")
+        print(f"      Baseline AR (3B)         : \033[1m{ar_tps:6.2f} tokens/sec\033[0m ({ar_res['time_sec']:.2f}s)")
+        print(f"      Speculative (K={gamma})       : \033[1;32m{spec_tps:6.2f} tokens/sec\033[0m ({spec_res['time_sec']:.2f}s)")
+        print(f"      Effective Acceleration   : \033[1;32m{speedup:6.2f}x FASTER\033[0m ⚡")
+        print("  • UI & TERMINAL I/O LATENCY:")
+        print(f"      Baseline Display Time    : {ar_disp_ms:6.1f} ms")
+        print(f"      Speculative Display Time : {spec_disp_ms:6.1f} ms")
+        print("  • SPECULATIVE EFFICIENCY:")
+        print(f"      Draft Model Acceptance   : \033[1;36m{acc_rate:6.1f}%\033[0m")
+        print(f"      Output Tok / Target Fwd  : \033[1m{otptf:6.2f} tokens/fwd\033[0m")
         print("═" * 72 + "\n")
 
 

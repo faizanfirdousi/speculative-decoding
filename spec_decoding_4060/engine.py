@@ -148,11 +148,17 @@ class SpeculativeEngine:
         if streamer is not None and hasattr(streamer, "end"):
             streamer.end()
 
+        display_time = streamer.display_time if (streamer is not None and hasattr(streamer, "display_time")) else 0.0
+        pure_inf_time = max(1e-6, elapsed - display_time)
+
         return {
             "output_ids": curr_ids,
             "tokens_generated": generated_tokens,
             "time_sec": elapsed,
-            "tps": generated_tokens / elapsed
+            "tps": generated_tokens / elapsed,
+            "inference_time_sec": pure_inf_time,
+            "display_time_sec": display_time,
+            "inference_tps": generated_tokens / pure_inf_time,
         }
 
     @torch.inference_mode()
@@ -160,7 +166,11 @@ class SpeculativeEngine:
         self,
         input_ids: torch.Tensor,
         max_new_tokens: int,
-        gamma: int,
+        gamma: int = 4,
+        adaptive: bool = False,
+        min_gamma: int = 1,
+        max_gamma: int = 8,
+        baseline_tps: Optional[float] = None,
         stream: bool = False,
         streamer: Any = None,
         colorize: bool = False,
@@ -168,11 +178,21 @@ class SpeculativeEngine:
         """
         Custom Greedy Speculative Decoding with KV-Cache Rollback.
         Guarantees zero prompt recomputation and 100% mathematical equivalence to Target.
+        Supports fixed lookahead (gamma) or cost-aware dynamic adaptive lookahead (adaptive=True).
         """
+        if gamma <= 0:
+            adaptive = True
+            gamma = 4
+
         if stream and streamer is None and LiveTokenStreamer is not None:
+            label_str = (
+                f"Custom Speculative (Adaptive K={min_gamma}..{max_gamma})"
+                if adaptive
+                else f"Custom Speculative (0.5B->3B, K={gamma})"
+            )
             streamer = LiveTokenStreamer(
                 self.tokenizer,
-                label=f"Custom Speculative (0.5B->3B, K={gamma})",
+                label=label_str,
                 is_speculative=True,
                 colorize=colorize,
             )
@@ -207,6 +227,10 @@ class SpeculativeEngine:
         target_forward_passes = 1  # initial prompt prefill
         verification_cycles = 0
 
+        current_k = gamma
+        recent_cycles: List[Dict[str, Any]] = []
+        k_history: List[int] = [current_k]
+
         # 2. Main Speculative Loop
         while (curr_ids.shape[1] - prompt_len) < max_new_tokens:
             if curr_ids[0, -1].item() == self.tokenizer.eos_token_id:
@@ -214,11 +238,12 @@ class SpeculativeEngine:
 
             # Determine how many tokens to draft without exceeding max_new_tokens
             remaining = max_new_tokens - (curr_ids.shape[1] - prompt_len)
-            current_gamma = min(gamma, remaining)
+            current_gamma = min(current_k, remaining)
             if current_gamma <= 0:
                 break
 
             # --- STEP A: DRAFTING K TOKENS ---
+            t_d0 = time.perf_counter()
             draft_tokens = []
             # Draft model needs to process from its current KV cache state up to curr_ids
             draft_input = curr_ids[:, draft_kv.get_seq_length():]
@@ -232,10 +257,12 @@ class SpeculativeEngine:
 
             draft_seq = torch.cat(draft_tokens, dim=-1)  # Shape: (1, current_gamma)
             total_drafted += current_gamma
+            t_draft = time.perf_counter() - t_d0
 
             # --- STEP B: PARALLEL TARGET VERIFICATION ---
             # Target model currently has KV cache up to `curr_ids.shape[1] - 1`.
             # We feed the last confirmed token + all K draft tokens in ONE forward pass.
+            t_v0 = time.perf_counter()
             verify_input = torch.cat([curr_ids[:, -1:], draft_seq], dim=-1)  # Shape: (1, current_gamma + 1)
             t_out = self.target_model(input_ids=verify_input, past_key_values=target_kv, use_cache=True)
             target_kv = t_out.past_key_values
@@ -244,6 +271,7 @@ class SpeculativeEngine:
 
             # Target predictions for each of the drafted positions + 1 bonus position
             target_preds = torch.argmax(t_out.logits, dim=-1)  # Shape: (1, current_gamma + 1)
+            t_verify = time.perf_counter() - t_v0
 
             # --- STEP C: ACCEPT / REJECT & KV ROLLBACK ---
             n_accepted = 0
@@ -284,6 +312,52 @@ class SpeculativeEngine:
             crop_past_key_values(target_kv, valid_cache_len)
             crop_past_key_values(draft_kv, min(draft_kv.get_seq_length(), valid_cache_len))
 
+            # --- STEP E: COST-AWARE ADAPTIVE LOOKAHEAD HEURISTIC ---
+            if adaptive:
+                cycle_time = t_draft + t_verify
+                tokens_emitted = n_accepted + (1 if authoritative_token is not None else 0)
+                cycle_tps = tokens_emitted / max(1e-6, cycle_time)
+
+                recent_cycles.append({
+                    "k": current_gamma,
+                    "accepted": n_accepted,
+                    "t_draft": t_draft,
+                    "t_verify": t_verify,
+                    "cycle_time": cycle_time,
+                    "tokens": tokens_emitted,
+                    "cycle_tps": cycle_tps,
+                })
+                if len(recent_cycles) > 4:
+                    recent_cycles.pop(0)
+
+                avg_accepted = sum(c["accepted"] for c in recent_cycles) / len(recent_cycles)
+                tot_tok = sum(c["tokens"] for c in recent_cycles)
+                tot_time = sum(c["cycle_time"] for c in recent_cycles)
+                rolling_tps = tot_tok / max(1e-6, tot_time)
+                b_tps = (
+                    baseline_tps
+                    if (baseline_tps is not None and baseline_tps > 0)
+                    else (1.0 / max(1e-6, t_verify * 0.85))
+                )
+
+                if n_accepted == current_gamma:
+                    # 100% acceptance in this cycle: under-speculating, increase lookahead
+                    current_k = min(max_gamma, current_k + 1)
+                elif n_accepted == 0:
+                    # Complete rejection on the first draft token: immediately shrink lookahead
+                    current_k = max(min_gamma, current_k - 2)
+                elif rolling_tps < b_tps:
+                    # Speculative throughput is failing to beat baseline AR: reduce draft load
+                    current_k = max(min_gamma, current_k - 1)
+                elif avg_accepted < 1.4 and current_k > 2:
+                    # Average yield is less than 1.4 tokens: large K wastes drafting time
+                    current_k = max(min_gamma, current_k - 1)
+                elif avg_accepted >= current_k - 0.5 and rolling_tps >= b_tps * 1.15:
+                    # High yield and healthy speedup: expand lookahead
+                    current_k = min(max_gamma, current_k + 1)
+
+                k_history.append(current_k)
+
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start_time
         generated_tokens = curr_ids.shape[1] - prompt_len
@@ -304,11 +378,17 @@ class SpeculativeEngine:
             verification_cycles=verification_cycles,
         )
 
+        display_time = streamer.display_time if (streamer is not None and hasattr(streamer, "display_time")) else 0.0
+        pure_inf_time = max(1e-6, elapsed - display_time)
+
         return {
             "output_ids": curr_ids,
             "tokens_generated": generated_tokens,
             "time_sec": elapsed,
             "tps": generated_tokens / elapsed,
+            "inference_time_sec": pure_inf_time,
+            "display_time_sec": display_time,
+            "inference_tps": generated_tokens / pure_inf_time,
             "acceptance_rate": acceptance_rate,
             "tokens_per_target_step": otptf,
             "output_tokens_per_target_forward": otptf,
@@ -317,6 +397,9 @@ class SpeculativeEngine:
             "total_accepted": total_accepted,
             "target_forward_passes": target_forward_passes,
             "verification_cycles": verification_cycles,
+            "adaptive": adaptive,
+            "k_history": k_history,
+            "final_k": current_k if adaptive else gamma,
         }
 
     @torch.inference_mode()
