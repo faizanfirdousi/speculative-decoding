@@ -34,11 +34,21 @@ class SpecConfig4000:
 
     # ---- Hardware settings -----------------------------------------------
     DEVICE: str = "cuda:0"
-    DTYPE: torch.dtype = torch.bfloat16          # Ada Lovelace Tensor Core native
+    DTYPE: torch.dtype = torch.bfloat16          # Draft model dtype (Ada Tensor Core native)
+    # Target-model compute dtype. The 20 GB Ada can hold the 3B target in fp32, which
+    # removes the bfloat16 near-tie argmax flips (2 ULP at ~35.25) that made speculative
+    # output diverge from greedy AR. Greedy spec MUST reproduce AR token-for-token, so the
+    # target (both the AR baseline and the verify pass) runs in fp32 here. The 0.5B draft
+    # stays bfloat16. This is the ONE deliberate deviation from the "identical parameters"
+    # rule above, and it is required for exactness; set TARGET_DTYPE = DTYPE to disable.
+    TARGET_DTYPE: torch.dtype = torch.float32
     ATTN_IMPLEMENTATION: str = "sdpa"            # PyTorch SDPA
 
     # ---- Speculative decoding (tuned for ~20 GB VRAM / higher bandwidth) -
-    GAMMA: int = 8                               # larger K: more parallel verify work per step
+    # K=5, matching the 4060 profile. K=8 was measured on the Ada to *hurt*
+    # low-acceptance prompts (MESI 0.82x, custom-prompt 0.83x vs AR baseline):
+    # extra drafting latency is not repaid when acceptance is low.
+    GAMMA: int = 5
     MAX_NEW_TOKENS: int = 256
 
     # ---- Benchmark Execution Settings ------------------------------------

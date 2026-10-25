@@ -13,6 +13,9 @@ class SpecConfig:
     # Hardware Settings
     DEVICE: str = "cuda:0"
     DTYPE: torch.dtype = torch.bfloat16  # Native Tensor Core support on RTX 4060 (Ada)
+    # Target-model compute dtype. On the 8 GB card this must stay bfloat16:
+    # fp32 3B weights (~12 GB) do not fit. See SpecConfig4000 for the fp32 exactness mode.
+    TARGET_DTYPE: torch.dtype = DTYPE
     ATTN_IMPLEMENTATION: str = "sdpa"    # PyTorch Native Scaled Dot Product Attention
     
     # Speculative Decoding Hyperparameters

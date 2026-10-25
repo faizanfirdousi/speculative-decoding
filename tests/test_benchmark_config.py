@@ -1,4 +1,5 @@
 import pytest
+import torch
 from spec_decoding_4060.benchmark import (
     auto_detect_profile,
     load_profile_config,
@@ -17,7 +18,10 @@ def test_load_profile_config_rtx4060():
 def test_load_profile_config_rtx4000():
     cfg = load_profile_config("rtx4000")
     assert cfg.GPU_PROFILE == "rtx4000"
-    assert cfg.GAMMA == 8
+    # K=5 matches the 4060 profile; K=8 regressed low-acceptance prompts on the Ada.
+    assert cfg.GAMMA == 5
+    # The 20 GB Ada runs the target in fp32 so greedy spec reproduces AR token-for-token.
+    assert cfg.TARGET_DTYPE == torch.float32
     assert cfg.MEASURED_REPETITIONS == 3
     assert cfg.CUDNN_BENCHMARK is True
     assert cfg.ALLOW_TF32 is True

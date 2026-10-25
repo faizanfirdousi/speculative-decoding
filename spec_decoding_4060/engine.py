@@ -61,10 +61,11 @@ class SpeculativeEngine:
         print(f"[Init] Loading Tokenizer from {self.cfg.TARGET_MODEL_ID}...")
         self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.TARGET_MODEL_ID)
 
-        print(f"[Init] Loading Target Model ({self.cfg.TARGET_MODEL_ID}) in {self.cfg.DTYPE}...")
+        target_dtype = getattr(self.cfg, "TARGET_DTYPE", self.cfg.DTYPE)
+        print(f"[Init] Loading Target Model ({self.cfg.TARGET_MODEL_ID}) in {target_dtype}...")
         self.target_model = AutoModelForCausalLM.from_pretrained(
             self.cfg.TARGET_MODEL_ID,
-            dtype=self.cfg.DTYPE,
+            dtype=target_dtype,
             attn_implementation=self.cfg.ATTN_IMPLEMENTATION,
             low_cpu_mem_usage=True
         ).to(self.cfg.DEVICE).eval()
@@ -274,14 +275,20 @@ class SpeculativeEngine:
             t_verify = time.perf_counter() - t_v0
 
             # --- STEP C: ACCEPT / REJECT & KV ROLLBACK ---
-            n_accepted = 0
-            for i in range(current_gamma):
-                if draft_seq[0, i].item() == target_preds[0, i].item():
-                    n_accepted += 1
-                    if draft_seq[0, i].item() == self.tokenizer.eos_token_id:
-                        break
-                else:
-                    break
+            # Vectorized on-device comparison. The previous per-token loop issued up to
+            # K+1 `.item()` calls, each forcing a full CUDA sync; this performs a single
+            # sync for the first-mismatch index (plus one rare sync when EOS is present).
+            matches = draft_seq[0, :current_gamma] == target_preds[0, :current_gamma]
+            mismatches = (~matches).nonzero(as_tuple=True)[0]
+            n_accepted = int(mismatches[0].item()) if mismatches.numel() > 0 else current_gamma
+
+            # EOS counts as an accepted token, but generation must stop right after it.
+            if n_accepted > 0 and self.tokenizer.eos_token_id is not None:
+                eos_positions = (
+                    draft_seq[0, :n_accepted] == self.tokenizer.eos_token_id
+                ).nonzero(as_tuple=True)[0]
+                if eos_positions.numel() > 0:
+                    n_accepted = int(eos_positions[0].item()) + 1
 
             total_accepted += n_accepted
 

@@ -68,7 +68,7 @@ def print_banner(cfg: SpecConfig, gpu_name: str, vram_gb: float):
     print("\n" + "═" * 72)
     print("  🚀 Speculative Decoding Live Streamer & Speed Telemetry")
     print(f"  • GPU Hardware : {gpu_name} ({vram_gb:.2f} GB VRAM)")
-    print(f"  • Target Model : {cfg.TARGET_MODEL_ID} ({cfg.DTYPE})")
+    print(f"  • Target Model : {cfg.TARGET_MODEL_ID} ({getattr(cfg, 'TARGET_DTYPE', cfg.DTYPE)})")
     print(f"  • Draft Model  : {cfg.DRAFT_MODEL_ID} ({cfg.DTYPE})")
     print(f"  • Lookahead (K): {cfg.GAMMA} draft tokens per verification step")
     print("═" * 72 + "\n")

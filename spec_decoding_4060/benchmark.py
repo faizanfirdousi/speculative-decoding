@@ -350,7 +350,7 @@ def run_benchmarks(
     print("=" * 70)
     print(f"  Target Model        : {cfg.TARGET_MODEL_ID}")
     print(f"  Draft Model         : {cfg.DRAFT_MODEL_ID}")
-    print(f"  Precision & Attn    : {cfg.DTYPE} | {cfg.ATTN_IMPLEMENTATION}")
+    print(f"  Precision & Attn    : target={getattr(cfg, 'TARGET_DTYPE', cfg.DTYPE)} | draft={cfg.DTYPE} | {cfg.ATTN_IMPLEMENTATION}")
     print(f"  Speculative Gamma   : {cfg.GAMMA} lookahead tokens")
     print(f"  Max New Tokens      : {cfg.MAX_NEW_TOKENS}")
     print(f"  Active Device       : {cfg.DEVICE}")
@@ -547,6 +547,7 @@ def run_benchmarks(
             "draft_model_id": cfg.DRAFT_MODEL_ID,
             "device": cfg.DEVICE,
             "dtype": str(cfg.DTYPE),
+            "target_dtype": str(getattr(cfg, "TARGET_DTYPE", cfg.DTYPE)),
             "attn_implementation": cfg.ATTN_IMPLEMENTATION,
             "gamma": cfg.GAMMA,
             "max_new_tokens": cfg.MAX_NEW_TOKENS,
