@@ -58,7 +58,8 @@ class SpecConfig4000:
     MEASURED_REPETITIONS: int = 3                # median over repetitions for stable tok/s
     BENCHMARK_SEED: int = 42
     CUDNN_BENCHMARK: bool = True                 # fixed-shape decode; improves SDPA matmul selection
-    ALLOW_TF32: bool = True                      # Ada Lovelace 4th Gen Tensor Core TF32 acceleration
+    ALLOW_TF32: bool = True                      # Draft/bf16 path only: TF32 is force-disabled for
+                                                 # the fp32 target (its ~5e-4 truncation breaks exactness)
     TORCH_DETERMINISTIC: bool = False
     OUTPUT_DIR: str = "results/rtx4000"
 

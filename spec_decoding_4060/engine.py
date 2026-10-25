@@ -41,7 +41,8 @@ except (ImportError, AttributeError):
 class SpeculativeEngine:
     def __init__(self, config: Any):
         self.cfg = config
-        
+        self.target_dtype = getattr(self.cfg, "TARGET_DTYPE", self.cfg.DTYPE)
+
         # Explicitly activate selected CUDA device
         if torch.cuda.is_available() and hasattr(self.cfg, "DEVICE") and "cuda" in str(self.cfg.DEVICE):
             device_str = str(self.cfg.DEVICE)
@@ -54,6 +55,15 @@ class SpeculativeEngine:
             if getattr(self.cfg, "ALLOW_TF32", True):
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True
+            # An fp32 target exists solely to guarantee AR == spec token-for-token. TF32
+            # truncates fp32 matmul inputs to a 10-bit mantissa (~5e-4 relative error),
+            # which reintroduces the near-tie argmax flips and breaks exactness. Force
+            # true IEEE fp32 for the target whenever it is loaded in float32.
+            if self.target_dtype == torch.float32:
+                torch.backends.cuda.matmul.allow_tf32 = False
+                torch.backends.cudnn.allow_tf32 = False
+                torch.set_float32_matmul_precision("highest")
+                print("[Init] fp32 target detected -> TF32 disabled (IEEE fp32 matmul) for exactness.")
             if getattr(self.cfg, "TORCH_DETERMINISTIC", False):
                 torch.backends.cudnn.deterministic = True
                 torch.use_deterministic_algorithms(True)
@@ -61,11 +71,10 @@ class SpeculativeEngine:
         print(f"[Init] Loading Tokenizer from {self.cfg.TARGET_MODEL_ID}...")
         self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.TARGET_MODEL_ID)
 
-        target_dtype = getattr(self.cfg, "TARGET_DTYPE", self.cfg.DTYPE)
-        print(f"[Init] Loading Target Model ({self.cfg.TARGET_MODEL_ID}) in {target_dtype}...")
+        print(f"[Init] Loading Target Model ({self.cfg.TARGET_MODEL_ID}) in {self.target_dtype}...")
         self.target_model = AutoModelForCausalLM.from_pretrained(
             self.cfg.TARGET_MODEL_ID,
-            dtype=target_dtype,
+            dtype=self.target_dtype,
             attn_implementation=self.cfg.ATTN_IMPLEMENTATION,
             low_cpu_mem_usage=True
         ).to(self.cfg.DEVICE).eval()
