@@ -192,3 +192,18 @@ def test_optimal_lookahead_respects_bounds():
     probs = [1.0] * 8
     assert optimal_lookahead(probs, 1.0, 0.0, min_k=2, max_k=6) == 6
     assert 2 <= optimal_lookahead([0.1] * 8, 1.0, 0.9, min_k=2, max_k=6) <= 6
+
+
+# --- Regressions pinned to the measured RTX 4000 cost ratio (draft/target ~= 0.24).
+# These guard the K=1 collapse: a high acceptance rate must never select K=1. ---
+
+def test_optimal_lookahead_measured_ratio_high_acceptance_avoids_k1():
+    """alpha ~= 0.94 (code-gen prompt): K must be well above 1, not collapse to it."""
+    k = optimal_lookahead([0.94] * 8, target_cost=1.0, draft_cost=0.24, min_k=1, max_k=8)
+    assert k > 1
+
+
+def test_optimal_lookahead_measured_ratio_moderate_acceptance_picks_small_k():
+    """alpha ~= 0.70 (technical-explanation prompt): small K wins, but not K=1."""
+    k = optimal_lookahead([0.70] * 8, target_cost=1.0, draft_cost=0.24, min_k=1, max_k=8)
+    assert 1 < k < 5

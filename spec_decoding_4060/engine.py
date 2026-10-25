@@ -242,12 +242,15 @@ class SpeculativeEngine:
 
         current_k = gamma
         k_history: List[int] = [current_k]
-        # Adaptive-lookahead statistics. pos_reached[i] counts verification cycles whose
-        # first i+1 drafts were all reached (right-censored); pos_match[i] counts those
-        # where the draft at position i matched the target. The EMA costs feed the
-        # throughput model that selects K.
-        pos_reached = [0] * max_gamma
-        pos_match = [0] * max_gamma
+        # Adaptive-lookahead statistics. Under the standard speculative-decoding model
+        # (Leviathan et al. 2023) the per-draft acceptance probability is a single
+        # stationary rate alpha, so only the *first* draft position is tracked: it is
+        # observed on every cycle for any K. Deeper positions are only observed when all
+        # earlier drafts matched, which previously trapped the estimator in a K=1
+        # absorbing state (unobserved positions sat at an over-pessimistic prior and K=1
+        # never probed them again). The EMA costs feed the K-selection throughput model.
+        empirical_trials = 0
+        empirical_hits = 0
         ema_target_cost: Optional[float] = None
         ema_draft_cost: Optional[float] = None
 
@@ -339,16 +342,15 @@ class SpeculativeEngine:
             crop_past_key_values(draft_kv, min(draft_kv.get_seq_length(), valid_cache_len))
 
             # --- STEP E: COST-AWARE ADAPTIVE LOOKAHEAD ---
-            # Keep a right-censored estimate of the per-position accept probability
-            # (position i is only observed when all earlier drafts were accepted) plus
-            # EMAs of the target-verify and per-draft-token costs, then choose the K
-            # that maximizes predicted throughput = E[tokens | K] / (target + K*draft).
-            # Hysteresis (min_gain) keeps K from oscillating between adjacent values.
+            # Estimate the stationary acceptance rate alpha from the first draft position
+            # (Laplace-smoothed), model expected tokens per cycle with the geometric
+            # closed form (1 - a**(K+1)) / (1 - a), and choose the K that maximizes
+            # predicted throughput = E[tokens | K] / (target + K*draft). Hysteresis
+            # (min_gain) keeps K from oscillating between adjacent values.
             if adaptive:
-                for i in range(min(n_accepted + 1, current_gamma)):
-                    pos_reached[i] += 1
-                for i in range(min(n_accepted, current_gamma)):
-                    pos_match[i] += 1
+                empirical_trials += 1
+                if n_accepted >= 1:
+                    empirical_hits += 1
 
                 t_target_est = t_verify
                 t_draft_est = t_draft / max(1, current_gamma)
@@ -361,11 +363,9 @@ class SpeculativeEngine:
                     else 0.8 * ema_draft_cost + 0.2 * t_draft_est
                 )
 
-                # Laplace-smoothed conditional accept rates, one per draft position.
-                accept_probs = [
-                    (pos_match[i] + 1.0) / (pos_reached[i] + 2.0)
-                    for i in range(max_gamma)
-                ]
+                # Laplace-smoothed stationary acceptance rate, applied to every position.
+                alpha = (empirical_hits + 1.0) / (empirical_trials + 2.0)
+                accept_probs = [alpha] * max_gamma
                 current_k = optimal_lookahead(
                     accept_probs,
                     ema_target_cost,
