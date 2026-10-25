@@ -292,6 +292,9 @@ def run_benchmarks(
     save_output: bool = True,
     dry_run: bool = False,
     stream: bool = False,
+    adaptive: bool = False,
+    min_gamma: int = 1,
+    max_gamma: int = 8,
 ) -> Dict[str, Any]:
     """
     Main benchmark execution entry point.
@@ -351,7 +354,11 @@ def run_benchmarks(
     print(f"  Target Model        : {cfg.TARGET_MODEL_ID}")
     print(f"  Draft Model         : {cfg.DRAFT_MODEL_ID}")
     print(f"  Precision & Attn    : target={getattr(cfg, 'TARGET_DTYPE', cfg.DTYPE)} | draft={cfg.DTYPE} | {cfg.ATTN_IMPLEMENTATION}")
-    print(f"  Speculative Gamma   : {cfg.GAMMA} lookahead tokens")
+    gamma_desc = (
+        f"adaptive K in [{min_gamma}, {max_gamma}] (start K={cfg.GAMMA})"
+        if adaptive else f"{cfg.GAMMA} lookahead tokens"
+    )
+    print(f"  Speculative Gamma   : {gamma_desc}")
     print(f"  Max New Tokens      : {cfg.MAX_NEW_TOKENS}")
     print(f"  Active Device       : {cfg.DEVICE}")
     print(f"  Detected Hardware   : {hardware['gpu_name']} ({hardware['total_vram_gb']:.2f} GB VRAM)")
@@ -385,7 +392,10 @@ def run_benchmarks(
     print(f"[Warm-up] Running CUDA kernel warm-up ({warmup_prompt!r}, tokens={warmup_tokens})...")
     warmup_ids = engine.format_prompt(warmup_prompt)
     _ = engine.autoregressive_generate(warmup_ids, max_new_tokens=warmup_tokens)
-    _ = engine.custom_speculative_generate(warmup_ids, max_new_tokens=warmup_tokens, gamma=cfg.GAMMA)
+    _ = engine.custom_speculative_generate(
+        warmup_ids, max_new_tokens=warmup_tokens, gamma=cfg.GAMMA,
+        adaptive=adaptive, min_gamma=min_gamma, max_gamma=max_gamma,
+    )
     _ = engine.hf_assisted_generate(warmup_ids, max_new_tokens=warmup_tokens)
     torch.cuda.synchronize()
     print("[Warm-up] Complete.\n")
@@ -421,7 +431,8 @@ def run_benchmarks(
             if stream:
                 print(f"\n[Repetition {rep + 1}/{measured_reps}] Streaming Custom Speculative (K={cfg.GAMMA}):")
             spec_res = engine.custom_speculative_generate(
-                input_ids, cfg.MAX_NEW_TOKENS, cfg.GAMMA, stream=stream
+                input_ids, cfg.MAX_NEW_TOKENS, cfg.GAMMA, stream=stream,
+                adaptive=adaptive, min_gamma=min_gamma, max_gamma=max_gamma,
             )
             hf_res = engine.hf_assisted_generate(input_ids, cfg.MAX_NEW_TOKENS)
             ar_runs.append({"tps": ar_res["tps"], "time_sec": ar_res["time_sec"]})
@@ -437,8 +448,12 @@ def run_benchmarks(
             f"  -> Baseline Autoregressive : {ar_summary['tps']:.2f} tok/s "
             f"(median of {measured_reps}, σ≈{ar_summary.get('tps_std', 0):.2f})"
         )
+        spec_label = (
+            f"Custom Speculative (adaptive K, final={spec_res.get('final_k', cfg.GAMMA)})"
+            if adaptive else f"Custom Speculative (K={cfg.GAMMA})"
+        )
         print(
-            f"  -> Custom Speculative (K={cfg.GAMMA}): {spec_summary['tps']:.2f} tok/s "
+            f"  -> {spec_label}: {spec_summary['tps']:.2f} tok/s "
             f"(median of {measured_reps})"
         )
         print(f"  -> HF Native Assisted      : {hf_summary['tps']:.2f} tok/s (median of {measured_reps})")
@@ -496,6 +511,9 @@ def run_benchmarks(
                 "total_accepted": spec_res.get("total_accepted", 0),
                 "target_forward_passes": spec_res.get("target_forward_passes", 0),
                 "verification_cycles": spec_res.get("verification_cycles", 0),
+                "adaptive": spec_res.get("adaptive", False),
+                "final_k": spec_res.get("final_k", cfg.GAMMA),
+                "k_history": spec_res.get("k_history", []),
                 "raw_runs": spec_runs,
             },
             "hf_assisted": {
@@ -550,6 +568,9 @@ def run_benchmarks(
             "target_dtype": str(getattr(cfg, "TARGET_DTYPE", cfg.DTYPE)),
             "attn_implementation": cfg.ATTN_IMPLEMENTATION,
             "gamma": cfg.GAMMA,
+            "adaptive": adaptive,
+            "min_gamma": min_gamma,
+            "max_gamma": max_gamma,
             "max_new_tokens": cfg.MAX_NEW_TOKENS,
             "warmup_iterations": getattr(cfg, "WARMUP_ITERATIONS", 1),
             "warmup_tokens": warmup_tokens,
@@ -628,6 +649,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Override lookahead draft token count K (default: from profile config).",
+    )
+    parser.add_argument(
+        "--adaptive",
+        action="store_true",
+        help="Enable cost-aware adaptive lookahead: choose K per cycle from measured "
+             "acceptance and target/draft latencies (helps low-acceptance prompts).",
+    )
+    parser.add_argument(
+        "--min-gamma",
+        type=int,
+        default=1,
+        help="Lower bound for adaptive lookahead K (used with --adaptive).",
+    )
+    parser.add_argument(
+        "--max-gamma",
+        type=int,
+        default=8,
+        help="Upper bound for adaptive lookahead K (used with --adaptive).",
     )
     parser.add_argument(
         "--max-new-tokens",
@@ -720,6 +759,9 @@ def main():
         save_output=not args.no_save,
         dry_run=args.dry_run,
         stream=args.stream,
+        adaptive=args.adaptive,
+        min_gamma=args.min_gamma,
+        max_gamma=args.max_gamma,
     )
 
 

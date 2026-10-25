@@ -69,3 +69,65 @@ def plan_greedy_spec_step(
         emitted_draft_tokens=emitted_draft,
         emitted_authoritative=emitted_auth,
     )
+
+
+def expected_tokens_per_cycle(accept_probs: Sequence[float], k: int) -> float:
+    """
+    Expected number of tokens emitted per verification cycle for lookahead ``k``.
+
+    ``accept_probs[i]`` is the probability that the draft token at position ``i + 1``
+    is accepted, *conditioned on all earlier drafts having been accepted* (i.e. the
+    empirical match rate at that position). The cycle always emits one authoritative
+    (correction or bonus) token in addition to the accepted drafts, hence the leading 1.
+
+    For a stationary per-position rate this is ``(1 - a**(k+1)) / (1 - a)``.
+    """
+    total = 1.0
+    cumulative = 1.0
+    for i in range(min(k, len(accept_probs))):
+        cumulative *= accept_probs[i]
+        total += cumulative
+    return total
+
+
+def optimal_lookahead(
+    accept_probs: Sequence[float],
+    target_cost: float,
+    draft_cost: float,
+    *,
+    min_k: int = 1,
+    max_k: int = 8,
+    current_k: Optional[int] = None,
+    min_gain: float = 0.0,
+) -> int:
+    """
+    Pick the lookahead ``K`` that maximizes predicted decode throughput.
+
+    ``target_cost`` is the latency of one verification forward, ``draft_cost`` the
+    latency of one draft token. Throughput is modelled as
+
+        throughput(K) = expected_tokens_per_cycle(accept_probs, K) / (target_cost + K * draft_cost)
+
+    ``min_gain`` applies hysteresis: when ``current_k`` is valid, it is retained unless
+    some other ``K`` beats it by more than this relative margin, which prevents the
+    lookahead from oscillating between adjacent values.
+    """
+    target_cost = max(target_cost, 1e-9)
+    draft_cost = max(draft_cost, 1e-9)
+    lo = max(1, min_k)
+    hi = max(lo, max_k)
+
+    def throughput(k: int) -> float:
+        return expected_tokens_per_cycle(accept_probs, k) / (target_cost + k * draft_cost)
+
+    best_k = lo
+    best_value = throughput(lo)
+    for k in range(lo + 1, hi + 1):
+        value = throughput(k)
+        if value > best_value:
+            best_k, best_value = k, value
+
+    if current_k is not None and lo <= current_k <= hi:
+        if best_value <= throughput(current_k) * (1.0 + min_gain):
+            return current_k
+    return best_k

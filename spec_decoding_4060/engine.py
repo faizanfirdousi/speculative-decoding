@@ -10,6 +10,10 @@ from spec_decoding_4060.metrics import (
     validate_speculative_counters,
 )
 try:
+    from spec_decoding_4060.spec_logic import optimal_lookahead
+except ImportError:
+    from spec_logic import optimal_lookahead
+try:
     from spec_decoding_4060.streamer import LiveTokenStreamer
 except ImportError:
     try:
@@ -180,7 +184,6 @@ class SpeculativeEngine:
         adaptive: bool = False,
         min_gamma: int = 1,
         max_gamma: int = 8,
-        baseline_tps: Optional[float] = None,
         stream: bool = False,
         streamer: Any = None,
         colorize: bool = False,
@@ -238,8 +241,15 @@ class SpeculativeEngine:
         verification_cycles = 0
 
         current_k = gamma
-        recent_cycles: List[Dict[str, Any]] = []
         k_history: List[int] = [current_k]
+        # Adaptive-lookahead statistics. pos_reached[i] counts verification cycles whose
+        # first i+1 drafts were all reached (right-censored); pos_match[i] counts those
+        # where the draft at position i matched the target. The EMA costs feed the
+        # throughput model that selects K.
+        pos_reached = [0] * max_gamma
+        pos_match = [0] * max_gamma
+        ema_target_cost: Optional[float] = None
+        ema_draft_cost: Optional[float] = None
 
         # 2. Main Speculative Loop
         while (curr_ids.shape[1] - prompt_len) < max_new_tokens:
@@ -328,50 +338,43 @@ class SpeculativeEngine:
             crop_past_key_values(target_kv, valid_cache_len)
             crop_past_key_values(draft_kv, min(draft_kv.get_seq_length(), valid_cache_len))
 
-            # --- STEP E: COST-AWARE ADAPTIVE LOOKAHEAD HEURISTIC ---
+            # --- STEP E: COST-AWARE ADAPTIVE LOOKAHEAD ---
+            # Keep a right-censored estimate of the per-position accept probability
+            # (position i is only observed when all earlier drafts were accepted) plus
+            # EMAs of the target-verify and per-draft-token costs, then choose the K
+            # that maximizes predicted throughput = E[tokens | K] / (target + K*draft).
+            # Hysteresis (min_gain) keeps K from oscillating between adjacent values.
             if adaptive:
-                cycle_time = t_draft + t_verify
-                tokens_emitted = n_accepted + (1 if authoritative_token is not None else 0)
-                cycle_tps = tokens_emitted / max(1e-6, cycle_time)
+                for i in range(min(n_accepted + 1, current_gamma)):
+                    pos_reached[i] += 1
+                for i in range(min(n_accepted, current_gamma)):
+                    pos_match[i] += 1
 
-                recent_cycles.append({
-                    "k": current_gamma,
-                    "accepted": n_accepted,
-                    "t_draft": t_draft,
-                    "t_verify": t_verify,
-                    "cycle_time": cycle_time,
-                    "tokens": tokens_emitted,
-                    "cycle_tps": cycle_tps,
-                })
-                if len(recent_cycles) > 4:
-                    recent_cycles.pop(0)
-
-                avg_accepted = sum(c["accepted"] for c in recent_cycles) / len(recent_cycles)
-                tot_tok = sum(c["tokens"] for c in recent_cycles)
-                tot_time = sum(c["cycle_time"] for c in recent_cycles)
-                rolling_tps = tot_tok / max(1e-6, tot_time)
-                b_tps = (
-                    baseline_tps
-                    if (baseline_tps is not None and baseline_tps > 0)
-                    else (1.0 / max(1e-6, t_verify * 0.85))
+                t_target_est = t_verify
+                t_draft_est = t_draft / max(1, current_gamma)
+                ema_target_cost = (
+                    t_target_est if ema_target_cost is None
+                    else 0.8 * ema_target_cost + 0.2 * t_target_est
+                )
+                ema_draft_cost = (
+                    t_draft_est if ema_draft_cost is None
+                    else 0.8 * ema_draft_cost + 0.2 * t_draft_est
                 )
 
-                if n_accepted == current_gamma:
-                    # 100% acceptance in this cycle: under-speculating, increase lookahead
-                    current_k = min(max_gamma, current_k + 1)
-                elif n_accepted == 0:
-                    # Complete rejection on the first draft token: immediately shrink lookahead
-                    current_k = max(min_gamma, current_k - 2)
-                elif rolling_tps < b_tps:
-                    # Speculative throughput is failing to beat baseline AR: reduce draft load
-                    current_k = max(min_gamma, current_k - 1)
-                elif avg_accepted < 1.4 and current_k > 2:
-                    # Average yield is less than 1.4 tokens: large K wastes drafting time
-                    current_k = max(min_gamma, current_k - 1)
-                elif avg_accepted >= current_k - 0.5 and rolling_tps >= b_tps * 1.15:
-                    # High yield and healthy speedup: expand lookahead
-                    current_k = min(max_gamma, current_k + 1)
-
+                # Laplace-smoothed conditional accept rates, one per draft position.
+                accept_probs = [
+                    (pos_match[i] + 1.0) / (pos_reached[i] + 2.0)
+                    for i in range(max_gamma)
+                ]
+                current_k = optimal_lookahead(
+                    accept_probs,
+                    ema_target_cost,
+                    ema_draft_cost,
+                    min_k=min_gamma,
+                    max_k=max_gamma,
+                    current_k=current_k,
+                    min_gain=0.05,
+                )
                 k_history.append(current_k)
 
         torch.cuda.synchronize()
